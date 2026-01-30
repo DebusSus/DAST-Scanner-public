@@ -1,0 +1,14 @@
+version: '3.8'
+services:
+  dast-control:
+    build: .
+    container_name: dast-control
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./reports:/reports
+    env_file:
+      - .env
+    environment:
+      - DOCKER_HOST=tcp://host.docker.internal:2375
+    restart: unless-stopped
