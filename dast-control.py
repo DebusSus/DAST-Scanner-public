@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# Scanners: WhatWeb, testssl, WPScan, Droopescan, Joomscan, ZAP, nikto, w3af, wapiti, arachni, what web, nuclei
+# Scanners: WhatWeb, testssl, WPScan, Droopescan, Joomscan, ZAP, nikto, w3af, wapiti, arachni, nuclei
 
 import os
 import time
@@ -18,6 +18,7 @@ from typing import Dict, Any, List, Optional, Tuple
 import urllib.request
 import docker
 import re
+import socket
 
 # -------- Config / Env --------
 API_PORT = int(os.getenv("API_PORT", "8080"))
@@ -35,6 +36,7 @@ JOOMSCAN_IMAGE    = os.getenv("JOOMSCAN_IMAGE",    "owasp/joomscan")
 DEFAULT_WPVULNDB_TOKEN = os.getenv("WPVULNDB_API_TOKEN", "")
 NUCLEI_TEMPLATES       = os.getenv("NUCLEI_TEMPLATES", "/root/nuclei-templates")
 NUCLEI_UPDATE_ON_START = os.getenv("NUCLEI_UPDATE_ON_START", "true").lower() == "true"
+W3AF_IMAGE             = os.getenv("W3AF_IMAGE",             "andresriancho/w3af")
 
 docker_client = docker.from_env(version='1.41')
 
@@ -64,7 +66,7 @@ jobs: Dict[str, Dict[str, Any]] = {}
 SCANNERS = [
     "whatweb", "testssl",
     "wpscan", "droopescan", "joomscan",
-    "nikto", "nuclei", "zap",
+    "nikto", "nuclei", "zap", "w3af"
 ]
 CMS_SCANNERS = {"wordpress": "wpscan", "drupal": "droopescan", "joomla": "joomscan"}
 CMS_SCANNER_SET = {"wpscan", "droopescan", "joomscan"}
@@ -390,33 +392,85 @@ def run_container(image: str, cmd: List[str],
 
 # -------- Command builders --------
 def build_wpscan_cmd(target: str, opts: Dict[str, Any]) -> List[str]:
-    cmd = ["wpscan", "--url", target, "--format", "json"]
+    """Build WPScan command with proper JSON output"""
+    cmd = ["wpscan", "--url", target, "--format", "json", "--no-banner"]
+    
     token = opts.get("api_token") or DEFAULT_WPVULNDB_TOKEN
-    if token: cmd += ["--api-token", token]
-    if opts.get("random_user_agent", True): cmd.append("--random-user-agent")
-    if isinstance(opts.get("enumerate"), list) and opts["enumerate"]:
-        cmd += ["--enumerate", ",".join(opts["enumerate"])]
-    for key, flag in [
-        ("plugins_detection","--plugins-detection"),
-        ("themes_detection","--themes-detection"),
-        ("users_detection","--users-detection"),
-        ("max_threads","--max-threads"),
-        ("request_timeout","--request-timeout"),
-        ("wp_content_dir","--wp-content-dir"),
-        ("wp_plugins_dir","--wp-plugins-dir"),
-    ]:
-        v = opts.get(key)
-        if v is not None: cmd += [flag, str(v)]
-    if isinstance(opts.get("headers"), dict):
-        for k,v in opts["headers"].items(): cmd += ["--header", f"{k}: {v}"]
-    if opts.get("cookie_string"): cmd += ["--cookie-string", opts["cookie_string"]]
-    if opts.get("throttle_ms") is not None: cmd += ["--throttle", str(opts["throttle_ms"])]
-    if opts.get("rate_limit") is not None: cmd += ["--rate-limit", str(opts["rate_limit"])]
-    if opts.get("proxy"): cmd += ["--proxy", opts["proxy"]]
-    if opts.get("ignore_main_redirect"): cmd.append("--ignore-main-redirect")
-    if opts.get("disable_tls_checks"): cmd.append("--disable-tls-checks")
-    if opts.get("no_banner", True): cmd.append("--no-banner")
+    if token: 
+        cmd += ["--api-token", token]
+    
+    # Enumeration options
+    enumerate_opts = []
+    if opts.get("enumerate_plugins", True):
+        enumerate_opts.append("vp")
+    if opts.get("enumerate_themes", True):
+        enumerate_opts.append("vt")
+    if opts.get("enumerate_users", False):
+        enumerate_opts.append("u")
+    
+    if enumerate_opts:
+        cmd += ["--enumerate", ",".join(enumerate_opts)]
+    
+    # Stealth/performance options
+    if opts.get("random_user_agent", True): 
+        cmd.append("--random-user-agent")
+    if opts.get("stealthy", False):
+        cmd.append("--stealthy")
+    if opts.get("throttle"):
+        cmd += ["--throttle", str(opts["throttle"])]
+    if opts.get("request_timeout"):
+        cmd += ["--request-timeout", str(opts["request_timeout"])]
+    
+    # Proxy support
+    if opts.get("proxy"):
+        cmd += ["--proxy", opts["proxy"]]
+    
     return cmd
+
+def build_w3af_cmd(target: str, opts: Dict[str, Any]) -> Tuple[List[str], str]:
+    """
+    Build w3af command and generate scan script.
+    Returns (command, script_content) - script needs to be written to a temp file.
+    """
+    # Generate w3af script
+    script_lines = [
+        "plugins",  # Enter plugins menu
+        "output config text_file",  # Configure text output
+        f"set output_file /w3af/output/w3af_report.txt",
+        "set verbose True",
+        "back",  # Back to plugins menu
+        "output config xml_file",
+        f"set output_file /w3af/output/w3af_report.xml",
+        "back",
+        # Enable audit plugins (vulnerability detection)
+        "audit all,!sqli",  # Enable all audit plugins except SQLi (enable separately if needed)
+        "audit sqli",  # SQL injection
+        "back",
+        # Enable grep plugins (passive detection)
+        "grep all",
+        "back",
+        # Enable discovery plugins (spidering)
+        "discovery web_spider",
+        "discovery config web_spider",
+        "set only_forward True",
+        "back",
+        "back",
+        # Set target
+        "target",
+        f"set target {target}",
+        "back",
+        # Start scan
+        "start",
+        "exit"
+    ]
+    
+    script_content = "\n".join(script_lines)
+    
+    # Command to run script
+    cmd = ["w3af_console", "-s", "/w3af/script/w3af_script.txt"]
+    
+    return cmd, script_content
+
 
 def build_nikto_cmd(target: str, opts: Dict[str, Any]) -> List[str]:
     t = split_target_for_http_tools(target)
@@ -510,6 +564,80 @@ def build_joomscan_cmd(target: str, opts: Dict[str, Any]) -> List[str]:
     if opts.get("json", True): cmd += ["-o", "json"]
     return cmd
 
+def build_nuclei_cmd(target: str, opts: Dict[str, Any]) -> List[str]:
+    cmd = ["nuclei", "-u", target]
+    
+    # Handle Host header when using IP instead of hostname
+    original_host = opts.get("_original_host") if isinstance(opts, dict) else None
+    resolved_ip = opts.get("_resolved_ip") if isinstance(opts, dict) else None
+    
+    if original_host and resolved_ip:
+        # Check if target is using IP (not hostname)
+        parsed_target = urlparse(target)
+        if parsed_target.hostname == resolved_ip or parsed_target.hostname != original_host:
+            cmd.extend(["-H", f"Host: {original_host}"])
+            print(f"[NUCLEI CMD] Adding Host header: {original_host}", file=sys.stderr)
+    
+    # Handle auto-tags from WhatWeb
+    auto_tags = opts.get("_auto_tags", []) if isinstance(opts, dict) else []
+    
+    if auto_tags:
+        # Map common tags to Nuclei tag names
+        tag_mapping = {
+            "javascript": "js",
+            "jquery": "js",
+            "misconfiguration": "misconfig",
+            "tech": "tech",
+            "detection": "detect",
+            "wordpress": "wordpress,wp-plugin,wp-theme",
+            "drupal": "drupal",
+            "joomla": "joomla",
+            "nginx": "nginx",
+            "apache": "apache",
+            "php": "php"
+        }
+        
+        fixed_tags = set()
+        for tag in auto_tags:
+            tag_lower = tag.lower()
+            if tag_lower in tag_mapping:
+                # Split comma-separated mapped tags
+                for mapped in tag_mapping[tag_lower].split(","):
+                    fixed_tags.add(mapped)
+            else:
+                fixed_tags.add(tag_lower)
+        
+        # Add vulnerability-related tags unless explicitly in strict mode
+        if not opts.get("tag_mode") == "strict":
+            fixed_tags.update(["misconfig", "exposure", "vulnerability", "config"])
+        
+        if fixed_tags:
+            tags_str = ",".join(sorted(fixed_tags))
+            cmd.extend(["-tags", tags_str])
+            print(f"[NUCLEI CMD] Using tags: {tags_str}", file=sys.stderr)
+    
+    # Severity filter (always include all severities)
+    cmd.extend(["-severity", "info,low,medium,high,critical"])
+    
+    # Performance settings - increased timeout for connection issues
+    cmd.extend(["-c", "25", "-rate-limit", "150"])
+    
+    # Connection timeouts - generous to ensure connections work
+    cmd.extend(["-timeout", "15", "-max-host-error", "30"])
+    
+    # Output to file (ensures we capture results even if stdout buffered)
+    cmd.extend(["-jsonl", "-o", "/tmp/nuclei_results.jsonl"])
+    
+    # Stats for monitoring (removed -silent to see debug info)
+    cmd.extend(["-stats"])
+    
+    # Debug if requested
+    if opts.get("debug") if isinstance(opts, dict) else False:
+        cmd.append("-debug")
+        cmd.append("-verbose")
+    
+    return cmd
+
 # -------- Normalizers (unified schema) --------
 # ---------- testssl.sh ----------
 def normalize_testssl(raw_json_text: str, asset: str) -> List[Dict[str, Any]]:
@@ -580,6 +708,119 @@ def normalize_testssl(raw_json_text: str, asset: str) -> List[Dict[str, Any]]:
             ))
         else: 
             pass 
+    return findings
+
+# ---------- w3af --------------
+def normalize_w3af(raw_text: str, raw_xml: str, asset: str) -> List[Dict[str, Any]]:
+    """
+    Parse w3af output. Tries XML first, falls back to text parsing.
+    """
+    findings: List[Dict[str, Any]] = []
+    
+    # Try XML parsing first (more reliable)
+    if raw_xml and raw_xml.strip():
+        try:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(raw_xml)
+            
+            for vuln in root.findall(".//vulnerability"):
+                name = vuln.get("name", "w3af Finding")
+                severity = vuln.get("severity", "Low")
+                description = ""
+                
+                desc_elem = vuln.find("description")
+                if desc_elem is not None and desc_elem.text:
+                    description = desc_elem.text
+                
+                url_elem = vuln.find("url")
+                method_elem = vuln.find("method")
+                
+                url = url_elem.text if url_elem is not None else asset
+                method = method_elem.text if method_elem is not None else "GET"
+                
+                # CWE extraction from description
+                cwe = None
+                cwe_match = CWEREG.search(description)
+                if cwe_match:
+                    cwe = cwe_match.group(1)
+                
+                findings.append(_mk_finding(
+                    name=f"w3af: {name}",
+                    desc=description,
+                    rec="Review the vulnerability details and apply appropriate patches or configuration fixes.",
+                    sev=norm_sev(severity),
+                    req=f"{method} {url}",
+                    scanner=["w3af"]
+                ))
+            
+            if findings:
+                return findings
+        except Exception as e:
+            print(f"[w3af] XML parsing failed: {e}, falling back to text", file=sys.stderr)
+    
+    # Fallback to text parsing
+    if not raw_text:
+        return findings
+        
+    # Parse text format
+    # Format: "New <severity> vulnerability found:\nURL: <url>\nMethod: <method>\nDescription: <desc>"
+    vuln_pattern = re.compile(
+        r'New\s+(?:(CRITICAL|HIGH|MEDIUM|LOW|INFO)\s+)?vulnerability\s+found:\s*'
+        r'URL:\s*([^\n]+)\s*'
+        r'(?:Method:\s*([^\n]+)\s*)?'
+        r'(?:Vulnerable\s+parameter:\s*([^\n]+)\s*)?'
+        r'(?:Description:\s*([^\n]+(?:\n(?!\s*(?:New|URL:|Method:|Vulnerable|End|Traceback))[^\n]+)*))',
+        re.IGNORECASE | re.MULTILINE
+    )
+    
+    for match in vuln_pattern.finditer(raw_text):
+        severity = match.group(1) or "MEDIUM"
+        url = match.group(2).strip()
+        method = match.group(3) or "GET"
+        param = match.group(4)
+        description = match.group(5).strip() if match.group(5) else "No description"
+        
+        # Clean up the description
+        description = re.sub(r'\n\s+', ' ', description)
+        description = _strip_control(description)
+        
+        name = f"w3af: {description[:50]}..." if len(description) > 50 else f"w3af: {description}"
+        
+        req_parts = [f"{method} {url}"]
+        if param:
+            req_parts.append(f"Param: {param}")
+        
+        findings.append(_mk_finding(
+            name=name,
+            desc=description,
+            rec="Review vulnerability details and apply vendor patches or mitigations.",
+            sev=norm_sev(severity),
+            req="\n".join(req_parts),
+            scanner=["w3af"]
+        ))
+    
+    # Also look for "Information" findings (passive grep results)
+    info_pattern = re.compile(
+        r'Information:\s*([^\n]+)\s*\n'
+        r'URL:\s*([^\n]+)\s*\n'
+        r'(?:Method:\s*([^\n]+)\s*\n)?',
+        re.IGNORECASE
+    )
+    
+    for match in info_pattern.finditer(raw_text):
+        description = match.group(1).strip()
+        url = match.group(2).strip()
+        method = match.group(3) or "GET"
+        
+        findings.append(_mk_finding(
+            name=f"w3af Info: {description[:40]}",
+            desc=description,
+            rec="Review information disclosure issues.",
+            sev="INFO",
+            req=f"{method} {url}",
+            scanner=["w3af"]
+        ))
+    
     return findings
 
 # ---------- Nikto ----------
@@ -656,6 +897,7 @@ def normalize_nikto(raw_text: str, asset: str) -> List[Dict[str, Any]]:
 def normalize_nuclei(raw_text: str, asset: str) -> List[Dict[str, Any]]:
     findings: List[Dict[str, Any]] = []
     def _first(arr): return arr[0] if arr else None
+    
     for line in (raw_text or "").splitlines():
         line = line.strip()
         if not line or not (line.startswith("{") and line.endswith("}")):
@@ -664,25 +906,55 @@ def normalize_nuclei(raw_text: str, asset: str) -> List[Dict[str, Any]]:
             o = json.loads(line)
         except Exception:
             continue
-        name = o.get("info", {}).get("name") or o.get("name") or o.get("template-id") or "Nuclei finding"
-        sev = norm_sev(o.get("info", {}).get("severity") or o.get("severity"))
+            
+        # Extract info
+        info = o.get("info", {})
+        name = info.get("name") or o.get("template-id") or "Nuclei Finding"
+        severity = norm_sev(info.get("severity"))
         matched = o.get("matched-at") or o.get("host") or asset
-        evidence_parts = []
-        if "extracted-results" in o and o["extracted-results"]:
-            evidence_parts.append("Extracted: " + ", ".join(map(str, o["extracted-results"])))
-        if "matcher-name" in o and o["matcher-name"]:
-            evidence_parts.append(f"Matcher: {o['matcher-name']}")
-        desc = _strip_control((o.get("info", {}).get("description") or "").strip())
-        if evidence_parts:
-            desc = (desc + ("\n" if desc else "")) + "; ".join(evidence_parts)
-        cve = _first(CVEREG.findall(json.dumps(o.get("info", {}))))
-        cwe = _first(CWEREG.findall(json.dumps(o.get("info", {}))))
+        
+        # Build description
+        desc = info.get("description", "")
+        if o.get("extracted-results"):
+            desc += f"\nExtracted: {', '.join(map(str, o['extracted-results']))}"
+        if o.get("matcher-name"):
+            desc += f"\nMatcher: {o['matcher-name']}"
+        desc = _strip_control(desc.strip())
+        
+        # Extract CVE/CWE/CVSS from classification
+        classification = info.get("classification", {})
+        cve = None
+        cwe = None
         cvss = None
-        if "classification" in o.get("info", {}):
-            cvss = str(o["info"]["classification"].get("cvss-score") or "") or None
-            if not cvss:
-                cvss = _first(CVSSREG.findall(json.dumps(o["info"]["classification"])))
-        findings.append(_mk_finding(name, desc or "Detected by Nuclei.", _best_rec(name), sev, req=None, rep=matched, cve=cve, cwe=cwe, cvss=cvss, scanner=["nuclei"]))
+        
+        if classification:
+            cve_id = classification.get("cve-id")
+            if cve_id:
+                cve = cve_id if isinstance(cve_id, str) else ",".join(cve_id)
+            cwe_id = classification.get("cwe-id")
+            if cwe_id:
+                cwe = f"CWE-{cwe_id}" if isinstance(cwe_id, int) else str(cwe_id)
+            cvss = str(classification.get("cvss-score") or "")
+        
+        # Fallback to regex extraction from JSON blob
+        if not cve:
+            cve = _first(CVEREG.findall(json.dumps(o)))
+        if not cwe:
+            cwe = _first(CWEREG.findall(json.dumps(o)))
+            
+        findings.append(_mk_finding(
+            name=name,
+            desc=desc or f"Detected by template: {o.get('template-id')}",
+            rec=_best_rec(name),
+            sev=severity,
+            req=o.get("request", ""),
+            rep=o.get("response", "") or matched,
+            cve=cve,
+            cwe=cwe,
+            cvss=cvss,
+            scanner=["nuclei"]
+        ))
+        
     return findings
 
 # ---------- ZAP ----------
@@ -849,25 +1121,113 @@ def normalize_whatweb(raw_text: str, asset: str) -> Tuple[List[Dict[str, Any]], 
 
 # ---------- WPScan / Droopescan / Joomscan ----------
 def normalize_wpscan(raw_json_text: str, asset: str) -> List[Dict[str, Any]]:
+    """Parse WPScan JSON output into standardized findings"""
     f: List[Dict[str, Any]] = []
+    
+    if not raw_json_text or not raw_json_text.strip():
+        return f
+        
     raw_clean = _strip_control(raw_json_text)
+    
     try:
         data = json.loads(raw_clean)
-    except Exception:
+    except Exception as e:
+        print(f"[WPScan] JSON parse error: {e}", file=sys.stderr)
         return f
-    def _first(arr): return arr[0] if arr else None
-    for sect in ("version","plugins","themes","timthumbs"):
-        node = data.get(sect)
-        if isinstance(node, dict) and "vulnerabilities" in node:
-            vulns = node.get("vulnerabilities") or []
-            for v in vulns:
-                name = v.get("title") or v.get("name") or "WP vulnerability"
-                desc = _strip_control(v.get("detail") or v.get("references",""))
-                sev  = norm_sev(v.get("severity"))
-                cve  = _first(CVEREG.findall(json.dumps(v)))
-                cwe  = _first(CWEREG.findall(json.dumps(v)))
-                cvss = str(v.get("cvss") or v.get("cvss_score") or "") or None
-                f.append(_mk_finding(name, desc, _best_rec(name), sev, cve=cve, cwe=cwe, cvss=cvss, scanner=["wpscan"]))
+    
+    def cvss_to_severity(score):
+        """Convert CVSS score to severity"""
+        try:
+            score = float(score)
+            if score >= 9.0: return "CRITICAL"
+            elif score >= 7.0: return "HIGH"
+            elif score >= 4.0: return "MEDIUM"
+            elif score > 0: return "LOW"
+            else: return "INFO"
+        except:
+            return "MEDIUM"  # Default for WP vulns
+
+    # Process each section: version, plugins, themes, timthumbs
+    for sect_key in ("version", "plugins", "themes", "timthumbs"):
+        section = data.get(sect_key)
+        if not isinstance(section, dict):
+            continue
+            
+        vulns = section.get("vulnerabilities") or []
+        if not isinstance(vulns, list):
+            continue
+            
+        for v in vulns:
+            title = v.get("title") or "WordPress Vulnerability"
+            
+            # Build description
+            desc_parts = []
+            if v.get("description"):
+                desc_parts.append(v["description"])
+            elif v.get("detail"):
+                desc_parts.append(v["detail"])
+            
+            # Handle references (CVEs, exploits, etc)
+            refs = v.get("references", {})
+            ref_strs = []
+            cve = None
+            
+            if isinstance(refs, dict):
+                for ref_type, ref_val in refs.items():
+                    if isinstance(ref_val, list):
+                        for url in ref_val:
+                            ref_strs.append(f"{ref_type}: {url}")
+                            # Extract CVE from URLs
+                            if not cve and isinstance(url, str):
+                                cve_match = CVEREG.search(url)
+                                if cve_match:
+                                    cve = cve_match.group(1)
+                    else:
+                        ref_strs.append(f"{ref_type}: {ref_val}")
+                        if not cve and isinstance(ref_val, str):
+                            cve_match = CVEREG.search(ref_val)
+                            if cve_match:
+                                cve = cve_match.group(1)
+            else:
+                ref_strs.append(str(refs))
+            
+            if ref_strs:
+                desc_parts.append("References: " + ", ".join(ref_strs))
+            
+            description = _strip_control(" ".join(desc_parts))
+            
+            # Get CVSS score for severity
+            cvss_data = v.get("cvss", {})
+            cvss_score = None
+            if isinstance(cvss_data, dict):
+                cvss_score = cvss_data.get("score") or cvss_data.get("base_score")
+            else:
+                cvss_score = cvss_data
+            
+            cvss_str = str(cvss_score) if cvss_score else None
+            sev = cvss_to_severity(cvss_score) if cvss_score else "MEDIUM"
+            
+            f.append(_mk_finding(
+                name=f"WPScan: {title}",
+                desc=description,
+                rec="Update WordPress core/plugins/themes to the latest version. Review vulnerability references for specific patches.",
+                sev=sev,
+                cve=cve,
+                cvss=cvss_str,
+                scanner=["wpscan"]
+            ))
+    
+    # Also add interesting findings (version detection, etc) as INFO
+    if data.get("version") and data["version"].get("number"):
+        version = data["version"]["number"]
+        f.append(_mk_finding(
+            name=f"WordPress Version Detected: {version}",
+            desc=f"Running WordPress version {version}",
+            rec="Verify this is the latest stable version",
+            sev="INFO",
+            scanner=["wpscan"]
+        ))
+    
     return f
 
 def normalize_droopescan(raw_text: str, asset: str) -> List[Dict[str, Any]]:
@@ -950,6 +1310,132 @@ def normalize_all(asset: str,
 
 # =====================================================
 # -------- Runners / finish helper --------
+
+# [ADDED: Audit trail helper for CMS auto-detection]
+def add_cms_audit_finding(jid: str, detected_cms: Optional[str], triggered_scanner: Optional[str]):
+    """
+    Add an audit trail finding documenting the auto-detection decision.
+    This creates transparency in the report about why specific scanners were selected.
+    """
+    job = get_job(jid)
+    if not job:
+        return
+    
+    if detected_cms:
+        name = f"CMS Auto-Detection: {detected_cms.title()} Identified"
+        desc = (f"Automated fingerprinting via WhatWeb detected {detected_cms} technology signatures. "
+                f"Consequently, {triggered_scanner} was automatically engaged for targeted assessment. "
+                f"Timestamp: {int(time.time())}")
+        sev = "INFO"
+    else:
+        name = "CMS Auto-Detection: No CMS Found"
+        desc = ("WhatWeb completed technology fingerprinting but did not detect WordPress, Drupal, or Joomla. "
+                "CMS-specific scanners were automatically excluded to optimize scan duration.")
+        sev = "INFO"
+    
+    finding = _mk_finding(
+        name=name,
+        desc=desc,
+        rec="Verify that auto-detection results align with expected target technologies.",
+        sev=sev,
+        scanner=["whatweb", "orchestrator"]
+    )
+    
+    # Inject into WhatWeb results so it appears in final aggregation
+    if "whatweb" in job.get("scanner_results", {}):
+        job["scanner_results"]["whatweb"].append(finding)
+        
+        # Also update the individual scanner report file if it exists
+        try:
+            scanner_report_path = os.path.join(REPORTS_DIR, f"{jid}_whatweb.json")
+            if os.path.exists(scanner_report_path):
+                with open(scanner_report_path, 'r', encoding='utf-8') as f:
+                    report = json.load(f)
+                report["findings"].append(finding)
+                with open(scanner_report_path, 'w', encoding='utf-8') as f:
+                    json.dump(report, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[add_cms_audit_finding] Failed to update report file: {e}", file=sys.stderr)
+    
+    set_job(jid, **job)
+
+# [ADDED: Helper to extract Nuclei template tags from WhatWeb findings - PREP for next integration]
+def extract_nuclei_tags_from_whatweb(findings: List[Dict[str, Any]]) -> List[str]:
+    
+    tags = set()
+    tech_mapping = {
+        # CMS
+        "wordpress": "wordpress",
+        "drupal": "drupal", 
+        "joomla": "joomla",
+        "magento": "magento",
+        "prestashop": "prestashop",
+        #Moder apps
+        "jquery": "jquery",
+        "html5": "generic",
+        "script": "javascript",
+        "x-frame-options": "misconfiguration",
+        "uncommonheaders": "misconfiguration",
+         # Node.js/Express
+        "node.js": "nodejs",
+        "express": "express",
+        "angular": "angular",
+        "webpack": "javascript",
+        # Web Servers
+        "nginx": "nginx",
+        "apache": "apache",
+        "iis": "iis",
+        "tomcat": "tomcat",
+        "jboss": "jboss",
+        # Languages/Frameworks
+        "php": "php",
+        "jquery": "jquery",
+        "bootstrap": "bootstrap",
+        "angular": "angular",
+        "react": "react",
+        # Middleware
+        "weblogic": "weblogic",
+        "websphere": "websphere",
+        "coldfusion": "coldfusion",
+        # Databases (indirect detection)
+        "mysql": "mysql",
+        "postgresql": "postgresql",
+        "mssql": "mssql",
+        "mongodb": "mongodb",
+        # Cloud/Infra
+        "aws": "aws",
+        "azure": "azure",
+        "gcp": "gcp",
+        "docker": "docker",
+        "kubernetes": "k8s",
+        # Panels
+        "cpanel": "cpanel",
+        "plesk": "plesk",
+        "phpmyadmin": "phpmyadmin",
+    }
+    
+    for finding in findings:
+        vuln = finding.get("vulnerability", {})
+        name = vuln.get("name", "").lower()
+        desc = vuln.get("Description", "").lower()
+        
+        # Check technology detection findings
+        if "technology detected:" in name:
+            tech = name.split("technology detected:")[-1].strip().lower()
+            
+            # Direct matches
+            for key, tag in tech_mapping.items():
+                if key in tech or key in desc:
+                    tags.add(tag)
+            
+            # Pattern matching for versioned tech (e.g., "Apache/2.4.41")
+            if "apache" in tech or "apache" in desc:
+                tags.add("apache")
+            if "nginx" in tech or "nginx" in desc:
+                tags.add("nginx")
+                
+    return list(tags)
+
 def finish_scanner(jid: str, name: str, code: int, findings: List[Dict[str, Any]], out: str, err: str, parsed_ok: bool):
     job = get_job(jid)
     job["scanner_results"][name] = findings
@@ -989,15 +1475,131 @@ def write_job_state(jid: str) -> str:
     return fn
 
 def runner_wpscan(jid: str, target: str, opts: Dict[str, Any]):
-    job = get_job(jid); job["scanner_status"]["wpscan"]="running"; set_job(jid, **job)
+    """WPScan runner with better error handling"""
+    job = get_job(jid)
+    job["scanner_status"]["wpscan"] = "running"
+    set_job(jid, **job)
+    
     try:
         cmd = build_wpscan_cmd(target, opts.get("wpscan", {}))
-        cid, code, out, err = run_container(WPSCAN_IMAGE, cmd, volumes={"wpscan_cache":{"bind":"/root/.wpscan","mode":"rw"}})
-        job = get_job(jid); job["containers"]["wpscan"]=cid
+        print(f"[WPScan] Command: {' '.join(cmd)}", file=sys.stderr)
+        
+        # Use named volume for WPScan cache to avoid re-downloading data files
+        volumes = {
+            "wpscan_cache": {"bind": "/root/.wpscan", "mode": "rw"}
+        }
+        
+        cid, code, out, err = run_container(WPSCAN_IMAGE, cmd, volumes=volumes)
+        
+        job = get_job(jid)
+        job["containers"]["wpscan"] = cid
+        set_job(jid, **job)
+        
+        print(f"[WPScan] Exit code: {code}", file=sys.stderr)
+        
+        # WPScan returns 0 on success, 1 on vulnerabilities found (which is good for us), 5 on critical errors
+        if code not in [0, 1]:
+            print(f"[WPScan] Warning: Exit code {code} may indicate scan issues", file=sys.stderr)
+        
+        if err:
+            print(f"[WPScan] Stderr: {err[:500]}", file=sys.stderr)
+        
         findings = normalize_wpscan(out, target)
-        finish_scanner(jid, "wpscan", code, findings, out, err, parsed_ok=bool(findings))
+        print(f"[WPScan] Parsed {len(findings)} findings", file=sys.stderr)
+        
+        finish_scanner(jid, "wpscan", code, findings, out, err, parsed_ok=True)
+        
     except Exception as e:
-        job = get_job(jid); job["scanner_status"]["wpscan"]="error"; job["scanner_stderr"]["wpscan"]=str(e); set_job(jid, **job)
+        print(f"[WPScan] Exception: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        job = get_job(jid)
+        job["scanner_status"]["wpscan"] = "error"
+        job["scanner_stderr"]["wpscan"] = str(e)
+        set_job(jid, **job)
+
+
+def runner_w3af(jid: str, target: str, opts: Dict[str, Any]):
+    """w3af runner with script file generation"""
+    name = "w3af"
+    job = get_job(jid)
+    job["scanner_status"][name] = "running"
+    set_job(jid, **job)
+    
+    try:
+        import tempfile
+        import os
+        
+        # Build command and script content
+        cmd, script_content = build_w3af_cmd(target, opts.get(name, {}))
+        
+        # Create temp directory for w3af files
+        with tempfile.TemporaryDirectory() as tmpdir:
+            script_path = os.path.join(tmpdir, "w3af_script.txt")
+            output_dir = os.path.join(tmpdir, "output")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Write script file
+            with open(script_path, 'w') as f:
+                f.write(script_content)
+            
+            print(f"[w3af] Script written to {script_path}", file=sys.stderr)
+            print(f"[w3af] Script content:\n{script_content}", file=sys.stderr)
+            
+            # Mount volumes: script dir and output dir
+            volumes = {
+                tmpdir: {"bind": "/w3af", "mode": "rw"}
+            }
+            
+            # Run w3af (can take a long time, default timeout 30 mins)
+            print(f"[w3af] Starting scan...", file=sys.stderr)
+            cid, code, out, err = run_container(
+                "andresriancho/w3af",  # Official w3af image
+                cmd,
+                volumes=volumes,
+                **({"timeout": 1800} if not opts.get(name, {}).get("fast") else {"timeout": 600})
+            )
+            
+            job = get_job(jid)
+            job["containers"][name] = cid
+            set_job(jid, **job)
+            
+            print(f"[w3af] Exit code: {code}", file=sys.stderr)
+            
+            # Read output files
+            xml_output = ""
+            txt_output = ""
+            
+            txt_path = os.path.join(output_dir, "w3af_report.txt")
+            xml_path = os.path.join(output_dir, "w3af_report.xml")
+            
+            if os.path.exists(txt_path):
+                with open(txt_path, 'r', encoding='utf-8', errors='replace') as f:
+                    txt_output = f.read()
+                print(f"[w3af] Text report: {len(txt_output)} bytes", file=sys.stderr)
+            
+            if os.path.exists(xml_path):
+                with open(xml_path, 'r', encoding='utf-8', errors='replace') as f:
+                    xml_output = f.read()
+                print(f"[w3af] XML report: {len(xml_output)} bytes", file=sys.stderr)
+            
+            # Parse findings
+            findings = normalize_w3af(txt_output, xml_output, target)
+            print(f"[w3af] Parsed {len(findings)} findings", file=sys.stderr)
+            
+            # Save raw outputs for debugging
+            full_stdout = f"=== TEXT OUTPUT ===\n{txt_output}\n=== XML OUTPUT ===\n{xml_output}\n=== CONSOLE STDOUT ===\n{out}"
+            
+            finish_scanner(jid, name, code, findings, full_stdout, err, parsed_ok=True)
+            
+    except Exception as e:
+        print(f"[w3af] Exception: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        job = get_job(jid)
+        job["scanner_status"][name] = "error"
+        job["scanner_stderr"][name] = str(e)
+        set_job(jid, **job)
 
 def runner_nikto(jid: str, target: str, opts: Dict[str, Any]):
     job = get_job(jid); job["scanner_status"]["nikto"]="running"; set_job(jid, **job)
@@ -1025,29 +1627,146 @@ def runner_nikto(jid: str, target: str, opts: Dict[str, Any]):
         job = get_job(jid); job["scanner_status"]["nikto"]="error"; job["scanner_stderr"]["nikto"]=str(e); set_job(jid, **job)
 
 def runner_nuclei(jid: str, target: str, opts: Dict[str, Any]):
-    job = get_job(jid); job["scanner_status"]["nuclei"]="running"; set_job(jid, **job)
+    job = get_job(jid)
+    job["scanner_status"]["nuclei"] = "running"
+    set_job(jid, **job)
+    
     try:
+        # === IP RESOLUTION + HOST NETWORK ===
+        original_target = target
+        original_host = None
+        parsed = urlparse(target if "://" in target else f"http://{target}")
+        
+        try:
+            original_host = parsed.hostname
+            ip = socket.gethostbyname(parsed.hostname)
+            port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+            nuclei_target = f"{parsed.scheme}://{ip}:{port}{parsed.path or '/'}"
+            
+            print(f"[NUCLEI] Resolved {original_host} → {ip} | Using target: {nuclei_target}", file=sys.stderr)
+            
+            # Store network translation info for Host header
+            if "nuclei" not in opts:
+                opts["nuclei"] = {}
+            opts["nuclei"]["_original_host"] = original_host
+            opts["nuclei"]["_resolved_ip"] = ip
+            
+        except Exception as e:
+            print(f"[NUCLEI] Resolution failed ({e}) — falling back to original", file=sys.stderr)
+            nuclei_target = original_target
+            original_host = parsed.hostname
+
+        # Update templates
         if NUCLEI_UPDATE_ON_START:
             try:
                 ensure_image(NUCLEI_IMAGE)
+                print(f"[NUCLEI] Updating templates...", file=sys.stderr)
                 docker_client.containers.run(
                     image=NUCLEI_IMAGE,
-                    command=["nuclei","-update","-ut","-ud",NUCLEI_TEMPLATES],
+                    command=["nuclei", "-update-templates"],
                     detach=False, remove=True, stdout=True, stderr=True,
-                    volumes={"nuclei_templates":{"bind":NUCLEI_TEMPLATES,"mode":"rw"},
-                             "nuclei_data":{"bind":"/root/.config/nuclei","mode":"rw"}},
+                    volumes={"nuclei_templates": {"bind": NUCLEI_TEMPLATES, "mode": "rw"}},
+                    network="host"
                 )
-            except Exception:
-                pass
-        cmd = build_nuclei_cmd(target, opts.get("nuclei", {}))
-        volumes = {"nuclei_templates": {"bind": NUCLEI_TEMPLATES, "mode":"rw"},
-                   "nuclei_data": {"bind": "/root/.config/nuclei", "mode":"rw"}}
-        cid, code, out, err = run_container(NUCLEI_IMAGE, cmd, volumes=volumes)
-        job = get_job(jid); job["containers"]["nuclei"]=cid
-        findings = normalize_nuclei(out, target)
+                print(f"[NUCLEI] Templates updated", file=sys.stderr)
+            except Exception as e:
+                print(f"[NUCLEI] Template update warning: {e}", file=sys.stderr)
+
+        # Build command
+        cmd = build_nuclei_cmd(nuclei_target, opts.get("nuclei", {}))
+        print(f"[NUCLEI] Final command: {' '.join(cmd)}", file=sys.stderr)
+
+        # === CONNECTION DEBUG TEST ===
+        print(f"[NUCLEI DEBUG] Testing connectivity from inside container...", file=sys.stderr)
+        test_url = f"http://{ip}:{port}/" if 'ip' in locals() else nuclei_target
+        debug_cmd = ["curl", "-s", "-o", "/dev/null", "-w", 
+                     "HTTP Code: %{http_code}, Time: %{time_total}s, Size: %{size_download}\n", 
+                     "--max-time", "10", test_url]
+        if original_host:
+            debug_cmd.extend(["-H", f"Host: {original_host}"])
+        
+        _, debug_code, debug_out, debug_err = run_container(
+            NUCLEI_IMAGE, debug_cmd, network="host"
+        )
+        print(f"[NUCLEI DEBUG] Curl test result: {debug_out.strip()} (exit: {debug_code})", file=sys.stderr)
+
+        # Setup volumes - add tmp volume for output file
+        volumes = {
+            "nuclei_templates": {"bind": NUCLEI_TEMPLATES, "mode": "rw"},
+            "nuclei_data": {"bind": "/root/.config/nuclei", "mode": "rw"},
+            "nuclei_output": {"bind": "/tmp", "mode": "rw"}  # For output file
+        }
+
+        # === ACTUAL SCAN ===
+        print(f"[NUCLEI] Starting scan... This may take a while", file=sys.stderr)
+        cid, code, out, err = run_container(
+            NUCLEI_IMAGE, cmd, volumes=volumes, network="host",
+            **({"timeout": 3600} if opts.get("nuclei", {}).get("extended_timeout") else {})
+        )
+
+        print(f"[NUCLEI] Scan finished — Exit code: {code}", file=sys.stderr)
+        
+        # === READ OUTPUT FILE ===
+        # Try to read the output file from the container
+        print(f"[NUCLEI] Reading output file...", file=sys.stderr)
+        cat_cmd = ["cat", "/tmp/nuclei_results.jsonl"]
+        _, cat_code, file_content, cat_err = run_container(
+            NUCLEI_IMAGE, cat_cmd, volumes=volumes, network="host"
+        )
+        
+        # Use file content if stdout was empty or file has content
+        if file_content and len(file_content.strip()) > 0:
+            print(f"[NUCLEI] Found {len(file_content)} bytes in output file", file=sys.stderr)
+            out = file_content
+        elif out and len(out.strip()) > 0:
+            print(f"[NUCLEI] Using stdout ({len(out)} bytes)", file=sys.stderr)
+        else:
+            print(f"[NUCLEI] WARNING: No output in file or stdout", file=sys.stderr)
+
+        # === TEMPLATE COUNT VERIFICATION ===
+        template_count = 0
+        if err:
+            # Parse template count from stderr
+            match = re.search(r'Templates loaded for current scan:\s*(\d+)', err)
+            if match:
+                template_count = int(match.group(1))
+                print(f"[NUCLEI] Template count: {template_count}", file=sys.stderr)
+                
+                # Warning if suspiciously low
+                if template_count < 1000:
+                    print(f"[NUCLEI] WARNING: Low template count ({template_count})!", file=sys.stderr)
+            else:
+                print(f"[NUCLEI] Could not determine template count", file=sys.stderr)
+            
+            # Check for connection errors in stderr
+            if "context deadline exceeded" in err or "connection refused" in err.lower():
+                print(f"[NUCLEI] WARNING: Connection errors detected!", file=sys.stderr)
+            
+            print(f"[NUCLEI] Stderr preview:\n{err[:2000]}", file=sys.stderr)
+
+        job = get_job(jid)
+        job["containers"]["nuclei"] = cid
+        set_job(jid, **job)
+        
+        findings = normalize_nuclei(out, original_target)
+        print(f"[NUCLEI] Parsed {len(findings)} findings from output", file=sys.stderr)
+        
+        # If no findings but templates were loaded, log details
+        if not findings and template_count > 1000:
+            print(f"[NUCLEI] NOTE: {template_count} templates executed but 0 findings", file=sys.stderr)
+            print(f"[NUCLEI] This may mean the target doesn't match Nuclei signatures", file=sys.stderr)
+        
         finish_scanner(jid, "nuclei", code, findings, out, err, parsed_ok=bool(findings))
+        
     except Exception as e:
-        job = get_job(jid); job["scanner_status"]["nuclei"]="error"; job["scanner_stderr"]["nuclei"]=str(e); set_job(jid, **job)
+        print(f"[NUCLEI] Exception: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        job = get_job(jid)
+        job["scanner_status"]["nuclei"] = "error"
+        job["scanner_stderr"]["nuclei"] = str(e)
+        set_job(jid, **job)
+        
 
 def runner_zap(jid: str, target: str, opts: Dict[str, Any]):
     name = "zap"
@@ -1144,15 +1863,42 @@ def runner_testssl(jid: str, target: str, opts: Dict[str, Any]):
 
 def runner_whatweb(jid: str, target: str, opts: Dict[str, Any]):
     job = get_job(jid); job["scanner_status"]["whatweb"]="running"; set_job(jid, **job)
+    
+    # [ADDED: Enhanced error handling with graceful degradation]
     try:
         cmd = build_whatweb_cmd(target, opts.get("whatweb", {}))
+        print(f"[DEBUG WHATWEB] Command: {cmd}", file=sys.stderr)
+        
         cid, code, out, err = run_container(WHATWEB_IMAGE, cmd)
-        job = get_job(jid); job["containers"]["whatweb"]=cid
-        findings, cms_hits = normalize_whatweb(out, target)
+        
+        job = get_job(jid)
+        job["containers"]["whatweb"] = cid
+        set_job(jid, **job)
+        
+        # Handle non-zero exit codes gracefully (WhatWeb returns non-zero on some redirects/Errors)
+        if code != 0 and not out:
+            print(f"[DEBUG WHATWEB] Non-zero exit {code} with empty output, attempting to continue", file=sys.stderr)
+            # Create empty findings but don't fail the scan
+            ww_findings = []
+            cms_hits = []
+        else:
+            ww_findings, cms_hits = normalize_whatweb(out, target)
+            
         job["whatweb_detected_cms"] = cms_hits
-        finish_scanner(jid, "whatweb", code, findings, out, err, parsed_ok=True)
+        finish_scanner(jid, "whatweb", code, ww_findings, out, err, parsed_ok=True)
+        
+        print(f"[DEBUG WHATWEB] Detected technologies: {len(ww_findings)}, CMS hits: {cms_hits}", file=sys.stderr)
+        
     except Exception as e:
-        job = get_job(jid); job["scanner_status"]["whatweb"]="error"; job["scanner_stderr"]["whatweb"]=str(e); set_job(jid, **job)
+        print(f"[DEBUG WHATWEB] Exception: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        job = get_job(jid)
+        job["scanner_status"]["whatweb"] = "error"
+        job["scanner_stderr"]["whatweb"] = str(e)
+        # [ADDED: Graceful degradation - ensure scan continues even if WhatWeb fails]
+        job["whatweb_detected_cms"] = []
+        set_job(jid, **job)
 
 def runner_droopescan(jid: str, target: str, opts: Dict[str, Any]):
     name = "droopescan"
@@ -1239,23 +1985,68 @@ def orchestrator(jid: str):
         t.start(); threads.append(t)
 
     if job["auto_mode"] and not explicit_cms:
+        # [ADDED: Enhanced WhatWeb execution with audit trail and Nuclei prep]
+        print(f"[ORCHESTRATOR] Auto-mode: Running WhatWeb first for CMS detection", file=sys.stderr)
+        
         # Run WhatWeb synchronously to decide CMS scanner
         try:
             set_job(jid, scanner_status={**job["scanner_status"], "whatweb":"running"})
             cmd = build_whatweb_cmd(target, opts.get("whatweb", {}))
             cid, code, out, err = run_container(WHATWEB_IMAGE, cmd)
-            job = get_job(jid); job["containers"]["whatweb"]=cid
-            ww_findings, cms_hits = normalize_whatweb(out, target)
+            job = get_job(jid)
+            job["containers"]["whatweb"] = cid
+            
+            # Parse results with error handling
+            try:
+                ww_findings, cms_hits = normalize_whatweb(out, target)
+            except Exception as parse_err:
+                print(f"[ORCHESTRATOR] WhatWeb parsing error: {parse_err}, continuing with empty results", file=sys.stderr)
+                ww_findings, cms_hits = [], []
+            
             job["whatweb_detected_cms"] = cms_hits
             finish_scanner(jid, "whatweb", code, ww_findings, out, err, parsed_ok=True)
-        except Exception as e:
-            job = get_job(jid); job["scanner_status"]["whatweb"]="error"; job["scanner_stderr"]["whatweb"]=str(e); set_job(jid, **job)
+            
+            # [ADDED: Prep for Nuclei - extract tags from WhatWeb findings]
+            nuclei_tags = extract_nuclei_tags_from_whatweb(ww_findings)
+            if nuclei_tags:
+                print(f"[ORCHESTRATOR] WhatWeb suggests Nuclei tags: {nuclei_tags}", file=sys.stderr)
+                # Store for when Nuclei runner executes
+                if "nuclei" not in opts:
+                    opts["nuclei"] = {}
+                opts["nuclei"]["_auto_tags"] = nuclei_tags
 
-        # Decide CMS scanner
+                # Also add specific CMS templates if detected
+                cms_templates = {
+                "wordpress": ["wordpress", "wp-plugin", "wp-theme"],
+                "drupal": ["drupal"],
+                "joomla": ["joomla"]
+            }
+            for cms in cms_hits:
+                if cms in cms_templates:
+                    opts["nuclei"]["_auto_tags"].extend(cms_templates[cms])
+                    opts["nuclei"]["_auto_tags"] = list(set(opts["nuclei"]["_auto_tags"]))  # dedupe
+                
+        except Exception as e:
+            print(f"[ORCHESTRATOR] WhatWeb failed: {e}, continuing without CMS detection", file=sys.stderr)
+            job = get_job(jid)
+            job["scanner_status"]["whatweb"] = "error"
+            job["scanner_stderr"]["whatweb"] = str(e)
+            job["whatweb_detected_cms"] = []
+            cms_hits = []
+            set_job(jid, **job)
+            # Continue with empty cms_hits (graceful degradation)
+
+        # Decide CMS scanner based on WhatWeb results
         cms_to_run = None
+        detected_cms_name = None
         for cms in ["wordpress","drupal","joomla"]:
             if cms in (get_job(jid).get("whatweb_detected_cms") or []):
-                cms_to_run = CMS_SCANNERS[cms]; break
+                cms_to_run = CMS_SCANNERS[cms]
+                detected_cms_name = cms
+                break
+
+        # [ADDED: Add audit trail finding documenting the decision]
+        add_cms_audit_finding(jid, detected_cms_name, cms_to_run)
 
         effective = []
         for s in req:
@@ -1263,6 +2054,9 @@ def orchestrator(jid: str):
                 effective.append(s)
         if cms_to_run:
             effective.append(cms_to_run)
+            print(f"[ORCHESTRATOR] Auto-selected {cms_to_run} based on WhatWeb detection", file=sys.stderr)
+        else:
+            print(f"[ORCHESTRATOR] No CMS detected by WhatWeb, skipping CMS-specific scanners", file=sys.stderr)
 
         with jobs_lock:
             jobs[jid]["requested_scanners"] = effective
